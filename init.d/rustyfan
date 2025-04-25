@@ -1,0 +1,89 @@
+#!/sbin/openrc-run
+
+# Path to the rustyfan executable
+# Adjust if you installed it elsewhere
+command="/usr/local/bin/rustyfan"
+# Arguments passed to rustyfan
+# By default, it looks for /etc/rustyfan/config.toml
+command_args="--config /etc/rustyfan/config.toml"
+# Optional: Explicitly specify the config file if needed
+# command_args="--config /etc/rustyfan/config.toml"
+
+# PID file location
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# User and group to run as (rustyfan needs hardware access, often root)
+# If you've set up specific permissions (e.g., udev rules), you might change this.
+command_user="root"
+command_group="root"
+
+# Description of the service
+description="rustyfan - Fan control daemon based on temperature"
+
+# Need local filesystems mounted and logging
+depend() {
+    # Ensure logger utility is available for logging stdout/stderr
+    use logger
+}
+
+# Check configuration before starting
+checkconfig() {
+    # Check if the command exists
+    if [ ! -x "${command}" ]; then
+        eerror "${command} not found or not executable."
+        return 1
+    fi
+
+    # Check if the default config file exists if no specific one is provided
+    # You might want to add more robust config validation if rustyfan supports it
+    if [ -z "${command_args}" ] && [ ! -f "/etc/rustyfan/config.toml" ]; then
+         ewarn "Default config file /etc/rustyfan/config.toml not found."
+         ewarn "rustyfan might fail if it requires this configuration."
+         # Consider returning 1 here if the config is strictly required:
+         # eerror "Default config file /etc/rustyfan/config.toml not found."
+         # return 1
+    fi
+
+    # Check if a specified config file exists
+    config_path=$(echo "${command_args}" | grep -o -- '--config\s\+\S\+' | awk '{print $2}')
+    if [ -n "${config_path}" ] && [ ! -f "${config_path}" ]; then
+        eerror "Specified config file ${config_path} not found."
+        return 1
+    fi
+
+    return 0
+}
+
+# Start the service
+start() {
+    # Perform checks before attempting to start
+    checkconfig || return 1
+
+    ebegin "Starting ${RC_SVCNAME}"
+
+    # Start the daemon using start-stop-daemon
+    # --background: Run the process in the background
+    # --make-pidfile: Create the PID file
+    # --pidfile: Specify PID file location
+    # --user/--group: Specify user/group to run as
+    # --startas: The command to execute
+    # -- -c "${cmd_exec}": Pass the command string (including exec and pipe) to the shell
+    start-stop-daemon --start --quiet \
+        --background --make-pidfile --pidfile "${pidfile}" \
+        --user "${command_user}" --group "${command_group}" \
+	--stdout-logger /usr/bin/logger \
+        --exec "${command}" -- ${command_args}
+
+    eend $? "Failed to start ${RC_SVCNAME}"
+}
+
+# Stop the service
+stop() {
+    ebegin "Stopping ${RC_SVCNAME}"
+
+    # Stop the daemon using start-stop-daemon
+    # --pidfile: Use the PID file to identify the process
+    start-stop-daemon --stop --quiet --pidfile "${pidfile}"
+
+    eend $? "Failed to stop ${RC_SVCNAME}"
+}
