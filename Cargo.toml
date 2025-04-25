@@ -1,0 +1,13 @@
+[package]
+name = "rustyfan"
+version = "0.2.1"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] } # Use latest clap version, enable derive
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] } # Add serde
+serde_json = "1.0" # Add serde_json
+ctrlc = "3.4" # Add ctrlc
+toml = "0.8" # Add TOML crate
+directories = "5.0"
