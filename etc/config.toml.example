@@ -1,0 +1,7 @@
+# Adjust pump speed in relation to CPU core temp
+correlation_file = "/etc/rustyfan/fan_correlation.json"
+temp_sensor_spec = "k10temp/temp1"
+fan_control_spec = "nct6799/pwm7"
+fan_sensor_spec = "nct6799/fan7"
+min_temp = 39
+max_temp = 70
