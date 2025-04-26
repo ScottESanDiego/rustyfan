@@ -2,7 +2,7 @@
 
 # Path to the rustyfan executable
 # Adjust if you installed it elsewhere
-command="/usr/local/bin/rustyfan"
+command="/usr/bin/rustyfan"
 # Arguments passed to rustyfan
 # By default, it looks for /etc/rustyfan/config.toml
 command_args="--config /etc/rustyfan/config.toml"
