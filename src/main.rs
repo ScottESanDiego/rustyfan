@@ -28,6 +28,103 @@ struct CorrelationPoint {
     rpm: u32,
 }
 
+// --- Error Rate Limiting ---
+
+struct ErrorRateLimiter {
+    last_error_time: std::time::Instant,
+    error_count: u32,
+    suppressed_count: u32,
+}
+
+impl ErrorRateLimiter {
+    fn new() -> Self {
+        Self {
+            last_error_time: std::time::Instant::now(),
+            error_count: 0,
+            suppressed_count: 0,
+        }
+    }
+    
+    fn should_log(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_error_time);
+        
+        // Reset counter after 60 seconds
+        if elapsed > Duration::from_secs(60) {
+            if self.suppressed_count > 0 {
+                eprintln!("(Suppressed {} similar errors in the last minute)", self.suppressed_count);
+                self.suppressed_count = 0;
+            }
+            self.error_count = 0;
+            self.last_error_time = now;
+        }
+        
+        self.error_count += 1;
+        
+        // Log first 5 errors, then 1 per minute
+        if self.error_count <= 5 || elapsed > Duration::from_secs(60) {
+            true
+        } else {
+            self.suppressed_count += 1;
+            false
+        }
+    }
+}
+
+// --- Fan Health Monitoring ---
+
+struct FanHealthMonitor {
+    last_pwm_written: Option<u8>,
+    consecutive_failures: u32,
+    last_rpm_check: Option<u32>,
+}
+
+impl FanHealthMonitor {
+    fn new() -> Self {
+        Self {
+            last_pwm_written: None,
+            consecutive_failures: 0,
+            last_rpm_check: None,
+        }
+    }
+    
+    fn check_fan_response(
+        &mut self,
+        target_pwm: u8,
+        current_rpm: Result<u32, io::Error>,
+        min_rpm_expected: u32,
+    ) -> Result<(), String> {
+        self.last_pwm_written = Some(target_pwm);
+        
+        match current_rpm {
+            Ok(rpm) => {
+                // If we set a high PWM but fan isn't spinning, that's a problem
+                if target_pwm > 50 && rpm < min_rpm_expected / 2 {
+                    self.consecutive_failures += 1;
+                    if self.consecutive_failures >= 5 {
+                        return Err(format!(
+                            "Fan health check failed: PWM={} but RPM={} (expected >= {})",
+                            target_pwm, rpm, min_rpm_expected / 2
+                        ));
+                    }
+                } else {
+                    self.consecutive_failures = 0;
+                }
+                self.last_rpm_check = Some(rpm);
+                Ok(())
+            }
+            Err(e) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= 3 {
+                    Err(format!("Unable to read fan RPM after 3 attempts: {}", e))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 // --- Config File Struct ---
 #[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
@@ -172,17 +269,42 @@ fn find_hwmon_path_by_name(device_name: &str) -> Result<PathBuf, String> {
 
 // --- File I/O Functions ---
 
+/// Creates a backup of the correlation file before overwriting
+fn create_backup_before_save(path: &Path) -> Result<(), io::Error> {
+    if path.exists() {
+        let backup_path = path.with_extension("json.backup");
+        fs::copy(path, backup_path)?;
+    }
+    Ok(())
+}
+
 /// Saves correlation data to file atomically using a temporary file
 fn save_correlation(data: &[CorrelationPoint], path: &Path) -> Result<(), io::Error> {
+    // Create backup of existing file if it exists
+    if let Err(e) = create_backup_before_save(path) {
+        eprintln!("Warning: Could not create backup: {}", e);
+        // Continue anyway - backup is nice to have but not critical
+    }
+    
     // Write to a temporary file first
     let temp_path = path.with_extension("tmp");
+    
+    // Clean up any stale temp file
+    let _ = fs::remove_file(&temp_path);
+    
     let file = File::create(&temp_path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, data)
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, data)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("JSON serialization error: {}", e)))?;
+    
+    // Flush and sync to ensure data is written to disk
+    writer.flush()?;
+    writer.get_mut().sync_all()?;
+    drop(writer);
     
     // Atomically rename the temp file to the target file
     fs::rename(&temp_path, path)?;
+    
     Ok(())
 }
 
@@ -208,8 +330,62 @@ fn read_temperature(path: impl AsRef<Path>) -> Result<f64, io::Error> {
     }
 }
 
+fn read_temperature_with_retry(path: impl AsRef<Path>, max_retries: u32) -> Result<f64, io::Error> {
+    let path = path.as_ref();
+    let mut last_error = None;
+    
+    for attempt in 0..=max_retries {
+        match read_temperature(path) {
+            Ok(temp) => {
+                // Sanity check: detect obviously invalid readings
+                if temp < -100.0 || temp > 200.0 {
+                    let err = io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Suspicious temperature reading: {:.1}°C", temp)
+                    );
+                    
+                    if attempt < max_retries {
+                        eprintln!("Warning: Suspicious temperature reading: {:.1}°C, retrying...", temp);
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    return Err(err);
+                }
+                return Ok(temp);
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < max_retries {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    
+    Err(last_error.unwrap())
+}
+
 fn write_pwm(path: impl AsRef<Path>, value: u8) -> Result<(), io::Error> {
     fs::write(path, value.to_string())
+}
+
+fn write_pwm_with_retry(path: impl AsRef<Path>, value: u8, max_retries: u32) -> Result<(), io::Error> {
+    let path = path.as_ref();
+    let mut last_error = None;
+    
+    for attempt in 0..=max_retries {
+        match write_pwm(path, value) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < max_retries {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    
+    Err(last_error.unwrap())
 }
 
 fn enable_manual_pwm(path: impl AsRef<Path>) -> Result<(), io::Error> {
@@ -225,6 +401,33 @@ fn read_fan_rpm(path: impl AsRef<Path>) -> Result<u32, io::Error> {
             format!("Failed to parse RPM value: {}", e),
         )),
     }
+}
+
+// --- Hardware Verification ---
+
+fn verify_hardware_paths_accessible(
+    fan_pwm_path: &Path,
+    fan_sensor_path: &Path,
+    temp_sensor_path: &Path,
+) -> Result<(), String> {
+    // Check if paths still exist (might disappear on hardware changes)
+    if !fan_pwm_path.exists() {
+        return Err(format!("Fan PWM path disappeared: {}", fan_pwm_path.display()));
+    }
+    if !fan_sensor_path.exists() {
+        return Err(format!("Fan sensor path disappeared: {}", fan_sensor_path.display()));
+    }
+    if !temp_sensor_path.exists() {
+        return Err(format!("Temperature sensor path disappeared: {}", temp_sensor_path.display()));
+    }
+    
+    // Try to read to ensure they're actually accessible
+    fs::read_to_string(temp_sensor_path)
+        .map_err(|e| format!("Cannot read temperature sensor: {}", e))?;
+    fs::read_to_string(fan_sensor_path)
+        .map_err(|e| format!("Cannot read fan sensor: {}", e))?;
+    
+    Ok(())
 }
 
 // --- Validation Functions ---
@@ -367,6 +570,27 @@ fn find_pwm_for_rpm(target_rpm: u32, correlation_data: &[CorrelationPoint]) -> O
 
 // --- Mode Functions ---
 
+/// Validates a calibration point for consistency
+fn validate_calibration_point(pwm: u8, rpm: u32, previous_points: &[CorrelationPoint]) -> Result<(), String> {
+    // Check for obviously bad readings
+    if pwm > 0 && rpm == 0 {
+        // This might be normal for low PWM values, just note it
+        println!("  Note: PWM {} resulted in 0 RPM (fan may not spin at this speed)", pwm);
+    }
+    
+    // Check for decreasing RPM with increasing PWM (should be monotonic or flat)
+    if let Some(last_point) = previous_points.last() {
+        if pwm > last_point.pwm && rpm > 0 && last_point.rpm > 0 && rpm < last_point.rpm.saturating_sub(200) {
+            return Err(format!(
+                "Unexpected RPM decrease: PWM {} -> {} but RPM {} -> {} (possible sensor error or unstable fan speed)",
+                last_point.pwm, pwm, last_point.rpm, rpm
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
 /// Runs the calibration sequence.
 fn run_calibration(
     correlation_file: &Path,
@@ -432,7 +656,18 @@ fn run_calibration(
         match read_fan_rpm(fan_sensor_path) {
             Ok(rpm) => {
                 println!("Measured RPM: {}", rpm);
-                correlation_data.push(CorrelationPoint { pwm: pwm_value, rpm });
+                
+                // Validate calibration point before adding
+                match validate_calibration_point(pwm_value, rpm, &correlation_data) {
+                    Ok(()) => {
+                        correlation_data.push(CorrelationPoint { pwm: pwm_value, rpm });
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: {}", e);
+                        eprintln!("Adding point anyway, but calibration data may be unreliable.");
+                        correlation_data.push(CorrelationPoint { pwm: pwm_value, rpm });
+                    }
+                }
             }
             Err(e) => {
                 println!("Error reading RPM: {}. Skipping point.", e);
@@ -479,14 +714,55 @@ fn run_control_loop(
     );
     println!("Min positive RPM from calibration: {}", min_positive_rpm);
     println!("Verbose output: {}", verbose);
+    println!("Reliability features: Retry logic, error rate limiting, fan health monitoring");
     println!("Press Ctrl+C to exit.");
 
+    // Initialize monitoring and error tracking
+    let mut temp_error_limiter = ErrorRateLimiter::new();
+    let mut pwm_error_limiter = ErrorRateLimiter::new();
+    let mut fan_health = FanHealthMonitor::new();
+    let mut last_successful_pwm: Option<u8> = None;
+    let mut hardware_check_counter = 0;
+
     while running.load(Ordering::SeqCst) {
-        // Read current temperature
-        let current_temp = match read_temperature(temp_sensor_path) {
+        // Periodically verify hardware is still accessible (every 60 iterations)
+        hardware_check_counter += 1;
+        if hardware_check_counter >= 60 {
+            if let Err(e) = verify_hardware_paths_accessible(
+                fan_pwm_path,
+                fan_sensor_path,
+                temp_sensor_path,
+            ) {
+                eprintln!("Critical hardware error: {}", e);
+                eprintln!("Hardware paths are no longer accessible. Exiting to restore auto control.");
+                return Err(e.into());
+            }
+            hardware_check_counter = 0;
+        }
+
+        // Read current temperature with retry logic
+        let current_temp = match read_temperature_with_retry(temp_sensor_path, 3) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Error reading temperature: {}", e);
+                if temp_error_limiter.should_log() {
+                    eprintln!("Error reading temperature: {}", e);
+                }
+                
+                // If we have a last known good PWM, keep using it
+                if let Some(pwm) = last_successful_pwm {
+                    if verbose {
+                        println!("Temperature read failed, maintaining last known PWM: {}", pwm);
+                    }
+                    // Re-apply last known PWM to maintain control
+                    if let Err(e) = write_pwm_with_retry(fan_pwm_path, pwm, 3) {
+                        if pwm_error_limiter.should_log() {
+                            eprintln!("Error re-applying PWM {} during temp failure: {}", pwm, e);
+                        }
+                    }
+                } else if verbose {
+                    println!("Temperature read failed and no fallback PWM available");
+                }
+                
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
@@ -507,22 +783,52 @@ fn run_control_loop(
         // Find and apply appropriate PWM value
         match find_pwm_for_rpm(target_rpm, correlation_data) {
             Some(target_pwm) => {
-                if let Err(e) = write_pwm(fan_pwm_path, target_pwm) {
-                    eprintln!(
-                        "Error writing PWM value {} to {}: {}",
-                        target_pwm,
-                        fan_pwm_path.display(),
-                        e
-                    );
-                } else if verbose {
-                    let rpm_str = match read_fan_rpm(fan_sensor_path) {
-                        Ok(rpm) => format!("{} RPM", rpm),
-                        Err(_) => "Error".to_string(),
-                    };
-                    println!(
-                        "Temp: {:.1}°C -> Target: {} RPM -> Actual: {} -> Set PWM: {}",
-                        current_temp, target_rpm, rpm_str, target_pwm
-                    );
+                // Write PWM with retry logic
+                match write_pwm_with_retry(fan_pwm_path, target_pwm, 3) {
+                    Ok(()) => {
+                        last_successful_pwm = Some(target_pwm);
+                        
+                        // Check fan health by reading current RPM
+                        let rpm_result = read_fan_rpm(fan_sensor_path);
+                        
+                        // Store RPM value and error status separately for later use
+                        let rpm_str = match &rpm_result {
+                            Ok(rpm) => {
+                                format!("{} RPM", rpm)
+                            }
+                            Err(_) => "Error".to_string(),
+                        };
+                        
+                        if let Err(e) = fan_health.check_fan_response(
+                            target_pwm,
+                            rpm_result,
+                            min_positive_rpm,
+                        ) {
+                            eprintln!("Fan health check failed: {}", e);
+                            eprintln!("This may indicate a disconnected or failed fan.");
+                            eprintln!("Exiting to restore automatic fan control.");
+                            return Err(e.into());
+                        }
+                        
+                        if verbose {
+                            println!(
+                                "Temp: {:.1}°C -> Target: {} RPM -> Actual: {} -> Set PWM: {}",
+                                current_temp, target_rpm, rpm_str, target_pwm
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if pwm_error_limiter.should_log() {
+                            eprintln!(
+                                "Error writing PWM value {} to {}: {}",
+                                target_pwm,
+                                fan_pwm_path.display(),
+                                e
+                            );
+                        }
+                        // Continue operating - better to keep trying than to crash
+                        // The next iteration will attempt to write again
+                    }
                 }
             }
             None => {
