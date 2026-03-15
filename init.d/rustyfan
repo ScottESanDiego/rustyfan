@@ -51,6 +51,15 @@ checkconfig() {
         return 1
     fi
 
+    # Validate schema and hwmon paths without taking PWM control.
+    if [ -n "${config_path}" ]; then
+        ${command} --config "${config_path}" --validate-only >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            eerror "rustyfan configuration validation failed for ${config_path}."
+            return 1
+        fi
+    fi
+
     return 0
 }
 

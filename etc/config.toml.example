@@ -1,7 +1,57 @@
-# Adjust pump speed in relation to CPU core temp
-correlation_file = "/etc/rustyfan/fan_correlation.json"
-temp_sensor_spec = "k10temp/temp1"
-fan_control_spec = "nct6799/pwm7"
-fan_sensor_spec = "nct6799/fan7"
-min_temp = 39
-max_temp = 70
+interval = 5
+
+[calibration]
+min_pwm = 0
+max_pwm = 255
+pwm_step = 10
+delay_ms = 2000
+
+[[sensors]]
+id = "cpu"
+spec = "k10temp/temp1"
+min_temp = 39.0
+max_temp = 80.0
+
+[[sensors]]
+id = "vrm"
+spec = "nct6799/temp3"
+min_temp = 35.0
+max_temp = 75.0
+
+[[fans]]
+id = "cpu_fan"
+pwm_spec = "nct6799/pwm7"
+rpm_spec = "nct6799/fan7"
+correlation_file = "/etc/rustyfan/cpu_fan_correlation.json"
+min_rpm = 500
+max_rpm = 2200
+fail_safe_pwm = 200
+min_expected_rpm = 400
+
+[[fans]]
+id = "front_intake"
+pwm_spec = "nct6799/pwm5"
+rpm_spec = "nct6799/fan5"
+correlation_file = "/etc/rustyfan/front_intake_correlation.json"
+min_rpm = 450
+max_rpm = 1700
+fail_safe_pwm = 180
+min_expected_rpm = 350
+
+# Many-to-one: cpu_fan is driven by both cpu and vrm sensors.
+[[associations]]
+sensor_id = "cpu"
+fan_id = "cpu_fan"
+weight = 0.7
+min_contribution_rpm = 800
+
+[[associations]]
+sensor_id = "vrm"
+fan_id = "cpu_fan"
+weight = 0.3
+
+# One-to-many: cpu sensor also drives front_intake.
+[[associations]]
+sensor_id = "cpu"
+fan_id = "front_intake"
+weight = 1.0
